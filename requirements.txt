@@ -1,0 +1,13 @@
+fastapi>=0.115
+uvicorn[standard]
+psycopg2-binary
+requests
+beautifulsoup4
+selenium
+webdriver-manager
+tiktok-captcha-solver
+selenium-wire
+blinker==1.6.2
+pydantic>=2.8
+starlette>=0.39
+uvicorn[standard]>=0.30
