@@ -633,127 +633,7 @@ async def tiktok_profiles_batch(
                 failures[profile_url] = f"Error loading page: {exc}"
                 continue
 
-            # allow dynamic content to load and trigger API requests
-            time.sleep(4)
-            try:
-                for i in range(3):
-                    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                    logger.info("Scrolled profile %s iteration %d", username, i + 1)
-                    time.sleep(1.5)
-            except Exception as exc:
-                logger.warning("Scrolling error for %s: %s", username, exc)
             html = driver.page_source
-
-            cookies = {cookie['name']: cookie['value'] for cookie in driver.get_cookies()}
-            if "msToken" not in cookies:
-                try:
-                    cookie_str = driver.execute_script("return document.cookie;") or ""
-                except Exception:
-                    cookie_str = ""
-                for part in cookie_str.split(";"):
-                    if "=" not in part:
-                        continue
-                    k, v = part.split("=", 1)
-                    k = k.strip()
-                    v = v.strip()
-                    if k and k not in cookies:
-                        cookies[k] = v
-            api_payload = None
-
-            def _sanitize_headers(raw_headers: dict[str, str]) -> dict[str, str]:
-                """Drop pseudo headers & Content-Length so requests can reuse them."""
-                sanitized = {}
-                for key, value in (raw_headers or {}).items():
-                    if not key:
-                        continue
-                    if key.startswith(":"):
-                        continue
-                    if key.lower() == "content-length":
-                        continue
-                    sanitized[key] = value
-                if "User-Agent" not in sanitized:
-                    try:
-                        ua = driver.execute_script("return navigator.userAgent;")
-                    except Exception:
-                        ua = None
-                    sanitized["User-Agent"] = ua or (
-                        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                    )
-                return sanitized
-
-            def _ensure_ms_token_in_url(target_url: str) -> str:
-                token = cookies.get("msToken")
-                if not token:
-                    return target_url
-                parsed = urlparse(target_url)
-                query = parse_qs(parsed.query, keep_blank_values=True)
-                current = query.get("msToken")
-                if current and current[0]:
-                    return target_url
-                query["msToken"] = [token]
-                flattened = []
-                for key, values in query.items():
-                    if isinstance(values, list):
-                        for val in values:
-                            flattened.append((key, val))
-                    else:
-                        flattened.append((key, values))
-                new_query = urlencode(flattened)
-                return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
-
-            saw_item_list_request = False
-            for request_data in driver.requests:
-                url = getattr(request_data, "url", "") or ""
-                if "www.tiktok.com/api/post/item_list" not in url:
-                    continue
-                if not request_data.response:
-                    continue
-                saw_item_list_request = True
-
-                # Sync any Set-Cookie headers from this response into our cookie jar
-                resp_headers = getattr(request_data.response, "headers", {}) or {}
-                set_cookie_header = resp_headers.get("Set-Cookie") or resp_headers.get("set-cookie")
-                if set_cookie_header:
-                    cookie_parser = SimpleCookie()
-                    try:
-                        cookie_parser.load(set_cookie_header)
-                    except Exception:
-                        cookie_parser = None
-                    if cookie_parser:
-                        for key, morsel in cookie_parser.items():
-                            cookies[key] = morsel.value
-                # only reuse the captured browser response; skip replay to avoid signature mismatches
-                body = getattr(request_data.response, "body", b"")
-                if not body:
-                    continue
-                try:
-                    text = body.decode("utf-8")
-                except Exception:
-                    text = body.decode("utf-8", errors="ignore")
-                try:
-                    api_payload = json.loads(text)
-                    break
-                except Exception as exc:
-                    logger.warning(
-                        "Failed to decode captured TikTok item_list response for %s. First bytes: %r. Error: %s",
-                        username,
-                        body[:400],
-                        exc,
-                    )
-                    continue
-
-            if not saw_item_list_request:
-                logger.warning(
-                    "No TikTok item_list request captured for %s (profile_url=%s)",
-                    username,
-                    profile_url,
-                )
-            elif api_payload is None:
-                logger.warning(
-                    "TikTok item_list request captured but no JSON decoded for %s",
-                    username,
-                )
 
             soup = BeautifulSoup(html, "html.parser")
             logger.info("Profile %s page length %d chars", username, len(html))
@@ -776,220 +656,49 @@ async def tiktok_profiles_batch(
                 "avatar": avatar_el["src"] if avatar_el and avatar_el.has_attr("src") else "",
             }
 
-            items = []
-            if isinstance(api_payload, dict):
-                for key in ("itemList", "item_list", "items", "aweme_list"):
-                    candidate = api_payload.get(key)
-                    if isinstance(candidate, list):
-                        items = candidate
-                        break
-                if not items:
-                    data_section = api_payload.get("data")
-                    if isinstance(data_section, dict):
-                        for key in ("itemList", "item_list", "items", "aweme_list"):
-                            candidate = data_section.get(key)
-                            if isinstance(candidate, list):
-                                items = candidate
-                                break
-
-            # fallback: parse SIGI_STATE JSON for ItemModule data when API fetch fails
-            if not items:
-                sigi_state = soup.find("script", id="SIGI_STATE")
-                if sigi_state and sigi_state.string:
-                    try:
-                        sigi_data = json.loads(sigi_state.string)
-                        item_module = sigi_data.get("ItemModule")
-                        if isinstance(item_module, dict):
-                            items = list(item_module.values())
-                    except Exception:
-                        pass
-
-            metadata["total_videos"] = min(len(items), 10)
             metadata = {k: v for k, v in metadata.items() if v not in (None, "")}
             results["kol_metadata"][username] = metadata
 
-            post_entries = []
-            for item in (items or [])[:10]:
-                if not isinstance(item, dict):
-                    continue
-                video = item.get("video") or {}
-                stats = item.get("stats") or {}
-                caption = item.get("desc") or ""
-                hashtags = []
-                for extra in item.get("textExtra") or []:
-                    name = extra.get("hashtagName")
-                    if name:
-                        hashtags.append(name)
+            post_url = f"https://countik.com/api/exist/{username}"
 
-                post_entry = {
-                    "text": caption,
-                    "cover": video.get("cover") or video.get("originCover") or video.get("dynamicCover"),
-                    "likes": stats.get("diggCount"),
-                    "comments": stats.get("commentCount"),
-                    "shares": stats.get("shareCount"),
-                    "views": stats.get("playCount"),
-                    "hashtags": hashtags,
+            try:
+                headers = {
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/120.0.0.0 Safari/537.36"
+                    ),
+                    "Accept": "text/html,application/json;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9",
                 }
-                post_entry = {k: v for k, v in post_entry.items() if v not in (None, "") or k == "hashtags"}
-                if "hashtags" not in post_entry:
-                    post_entry["hashtags"] = []
-                post_entries.append(post_entry)
-
-            if not post_entries:
-                post_entries = []
-
-            results["kol_post_data"][username] = post_entries
-
-    finally:
-        driver.quit()
-
-    if not results["kol_metadata"]:
-        raise HTTPException(status_code=500, detail="Failed to scrape any provided profiles.")
-
-    if failures:
-        results["errors"] = failures
-
-    return results
-
-
-@router.post("/tiktok_profiles_basic_posts")
-async def tiktok_profiles_basic_posts(
-    urls: List[HttpUrl] = Body(..., embed=True, description="TikTok profile URLs, e.g. https://www.tiktok.com/@username")
-):
-    """Fetch profile metadata and lightweight post info (cover/text/hashtags) without relying on TikTok APIs."""
-    results = {"kol_metadata": {}, "kol_post_data": {}}
-    failures: dict[str, str] = {}
-    usernames = []
-
-    seen = set()
-    for raw_url in urls:
-        url_str = str(raw_url)
-        username = _extract_username_from_url(url_str)
-        if not username:
-            failures[url_str] = "Unable to extract username from URL"
-            continue
-        if username in seen:
-            continue
-        seen.add(username)
-        usernames.append(username)
-
-    if not usernames:
-        raise HTTPException(status_code=400, detail="No valid TikTok usernames found in request.")
-
-    chrome_bin = os.getenv("CHROME_BIN")
-    driver_path = os.getenv("CHROMEDRIVER_PATH")
-
-    opts = Options()
-    profile_dir = os.getenv("CHROME_PROFILE_DIR")
-    if chrome_bin:
-        opts.binary_location = chrome_bin
-    logger.info("Launching Selenium for basic posts with profile_dir=%s exists=%s", profile_dir, os.path.exists(profile_dir) if profile_dir else False)
-    # run headless by default; override externally when you need manual login
-    opts.add_argument("--headless")
-    opts.add_argument("--disable-gpu")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--window-size=1920,1080")
-    if profile_dir:
-        required = ["Cookies", "Preferences"]
-        missing = [name for name in required if not os.path.exists(os.path.join(profile_dir, name))]
-        if missing:
-            logger.warning("Chrome profile %s missing files: %s", profile_dir, ", ".join(missing))
-        opts.add_argument(f"--user-data-dir={profile_dir}")
-        opts.add_argument("--profile-directory=Default")
-
-    service = Service(driver_path) if driver_path else Service(ChromeDriverManager().install())
-
-    try:
-        driver = webdriver.Chrome(service=service, options=opts)
-    except WebDriverException as exc:
-        raise HTTPException(500, f"ChromeDriver error: {exc}")
-
-    try:
-        for username in usernames:
-            profile_url = f"https://www.tiktok.com/@{username}"
-            try:
-                driver.get(profile_url)
-            except Exception as exc:
-                failures[profile_url] = f"Error loading page: {exc}"
-                continue
-
-            time.sleep(4)
-            try:
-                for _ in range(3):
-                    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                    time.sleep(1.5)
-            except Exception:
-                pass
-            html = driver.page_source
-            dump_dir = os.getenv("HTML_DUMP_DIR")
-            # dump_dir = r"C:\Users\fin_t\OneDrive\เอกสาร\job_docs\Impower\apify_free\extracted_app\tiktok_html_dumps"
-            # dump_dir = "/data/html-dumps"
-            if dump_dir:
-                os.makedirs(dump_dir, exist_ok=True)
-                dump_path = os.path.join(dump_dir, f"{username}.html")
+                resp = requests.get(post_url, headers=headers, timeout=20)
+                # Try to parse JSON to extract sec_uid and fetch analyze endpoint
+                sec_uid = None
                 try:
-                    with open(dump_path, "w", encoding="utf-8") as fh:
-                        fh.write(html)
-                    logger.info("Wrote HTML dump for %s to %s", username, dump_path)
-                except Exception as exc:
-                    logger.warning("Failed to write HTML dump for %s: %s", username, exc)
-            soup = BeautifulSoup(html, "html.parser")
+                    exist_json = resp.json()
+                    if isinstance(exist_json, dict):
+                        sec_uid = exist_json.get("sec_uid") or exist_json.get("secUid")
+                except Exception:
+                    sec_uid = None
 
-            avatar_el = soup.select_one("[data-e2e='user-avatar'] img")
-            title_el = soup.select_one("[data-e2e='user-title']")
-            bio_el = soup.select_one("[data-e2e='user-bio']")
-            followers_el = soup.select_one("[data-e2e='followers-count']")
-            following_el = soup.select_one("[data-e2e='following-count']")
-            likes_el = soup.select_one("[data-e2e='likes-count']")
-
-            metadata = {
-                "name": title_el.get_text(strip=True) if title_el else username,
-                "account": username,
-                "bio": bio_el.get_text("\n", strip=True) if bio_el else "",
-                "url": profile_url,
-                "followers": _parse_compact_number(followers_el.get_text(strip=True) if followers_el else None),
-                "following": _parse_compact_number(following_el.get_text(strip=True) if following_el else None),
-                "total_likes": _parse_compact_number(likes_el.get_text(strip=True) if likes_el else None),
-                "region": None,
-                "avatar": avatar_el["src"] if avatar_el and avatar_el.has_attr("src") else "",
-            }
-            metadata = {k: v for k, v in metadata.items() if v not in (None, "")}
-            results["kol_metadata"][username] = metadata
-
-            cards = soup.select("[data-e2e='user-post-item']")
-            logger.info("Found %d user-post-item cards for %s", len(cards), username)
-            cookies_banner = soup.find(attrs={"id": "cookie-banner"})
-            if cookies_banner:
-                logger.warning("Cookie/banner detected for %s; may block content", username)
-            basic_posts = _extract_basic_posts_from_html(soup)
-            if not basic_posts:
-                sigi_state = soup.find("script", id="SIGI_STATE")
-                if sigi_state and sigi_state.string:
+                if sec_uid:
+                    analyze_url = f"https://countik.com/api/analyze/?sec_user_id={sec_uid}"
                     try:
-                        sigi_data = json.loads(sigi_state.string)
-                        item_module = sigi_data.get("ItemModule")
-                        if isinstance(item_module, dict):
-                            for item in list(item_module.values())[:10]:
-                                caption = item.get("desc") or ""
-                                hashtags = []
-                                for extra in item.get("textExtra") or []:
-                                    name = extra.get("hashtagName")
-                                    if name:
-                                        hashtags.append(name)
-                                basic_posts.append({
-                                    "text": caption,
-                                    "cover": item.get("video", {}).get("cover"),
-                                    "likes": None,
-                                    "comments": None,
-                                    "shares": None,
-                                    "views": None,
-                                    "hashtags": hashtags,
-                                })
-                    except Exception:
-                        pass
-            if not basic_posts:
-                logger.warning("No basic posts extracted for %s via HTML fallback", username)
-            results["kol_post_data"][username] = basic_posts
+                        analyze_resp = requests.get(analyze_url, headers=headers, timeout=30)
+                        analyze_payload: object
+                        try:
+                            analyze_payload = analyze_resp.json()
+                        except Exception:
+                            analyze_payload = analyze_resp.text
+                        # Store analyze payload under kol_post_data for this username
+                        results.setdefault("kol_post_data", {})[username] = analyze_payload["videos"]
+                    except Exception as exc_analyze:
+                        logger.warning("Failed to fetch Countik analyze for %s: %s", username, exc_analyze)
+                else:
+                    logger.info("No sec_uid found in Countik exist for %s", username)
+            except Exception as exc:
+                logger.warning("Failed to fetch Countik exist for %s: %s", username, exc)
+
 
     finally:
         driver.quit()
@@ -1001,7 +710,6 @@ async def tiktok_profiles_basic_posts(
         results["errors"] = failures
 
     return results
-
 
 @router.get("/tiktok_profile_search_scraper")
 async def tiktok_profile_search_scraper(

@@ -1,0 +1,21 @@
+version: "3.9"
+
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: extracted_app_web
+    ports:
+      - "8008:8008"
+    environment:
+      # Loaded from .env at project root
+      - DATABASE_URL=${DATABASE_URL}
+      - CHROME_PROFILE_DIR=/data/chrome-profile
+      - HTML_DUMP_DIR=/data/html-dumps
+    volumes:
+      - ./data/chrome-profile:/data/chrome-profile
+      - ./data/html-dumps:/data/html-dumps
+    restart: unless-stopped
+    # If your scraper uses headless Chrome, ensure shm size
+    shm_size: "1gb"
