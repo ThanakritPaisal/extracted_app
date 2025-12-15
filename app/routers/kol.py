@@ -16,6 +16,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from datetime import datetime
 import re, json, time, os, logging
 from tiktok_captcha_solver import make_undetected_chromedriver_solver
+import requests
 
 API_KEY = "1c5f034b5674c55173fda99041be9b77"
 logger = logging.getLogger(__name__)
@@ -618,6 +619,17 @@ async def tiktok_profiles_batch(
     except WebDriverException as exc:
         raise HTTPException(500, f"ChromeDriver error: {exc}")
 
+    def _safe_get_html(driver_instance):
+        """Attempt to get page HTML via JS (safer than page_source in some crash cases)."""
+        try:
+            return driver_instance.execute_script("return document.documentElement.outerHTML;")
+        except Exception:
+            # fallback to page_source; may raise WebDriverException on crashed tab
+            try:
+                return driver_instance.page_source
+            except Exception:
+                raise
+
     try:
         for username in usernames:
             profile_url = f"https://www.tiktok.com/@{username}"
@@ -627,22 +639,52 @@ async def tiktok_profiles_batch(
             except Exception:
                 pass
 
-            try:
-                driver.get(profile_url)
-            except Exception as exc:
-                failures[profile_url] = f"Error loading page: {exc}"
-                continue
+            # We'll allow one retry in case the tab crashes; recreate driver if needed
+            attempt = 0
+            html = None
+            while attempt < 2 and html is None:
+                attempt += 1
+                try:
+                    driver.get(profile_url)
+                except Exception as exc:
+                    failures[profile_url] = f"Error loading page: {exc}"
+                    break
 
-            # allow dynamic content to load and trigger API requests
-            time.sleep(4)
-            try:
-                for i in range(3):
-                    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                    logger.info("Scrolled profile %s iteration %d", username, i + 1)
-                    time.sleep(1.5)
-            except Exception as exc:
-                logger.warning("Scrolling error for %s: %s", username, exc)
-            html = driver.page_source
+                # allow dynamic content to load and trigger API requests
+                time.sleep(4)
+                try:
+                    for i in range(3):
+                        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                        logger.info("Scrolled profile %s iteration %d", username, i + 1)
+                        time.sleep(1.5)
+                except Exception as exc:
+                    logger.warning("Scrolling error for %s: %s", username, exc)
+
+                try:
+                    html = _safe_get_html(driver)
+                except Exception as exc:
+                    # Common sign: tab crashed / session lost. Try to recreate driver once.
+                    msg = str(exc)
+                    logger.warning("Failed to fetch HTML for %s on attempt %d: %s", username, attempt, msg)
+                    try:
+                        driver.quit()
+                    except Exception:
+                        pass
+                    if attempt < 2:
+                        try:
+                            driver = wire_webdriver.Chrome(service=service, options=opts)
+                            logger.info("Recreated Chrome driver to recover from crash for %s", username)
+                        except Exception as exc2:
+                            failures[profile_url] = f"Failed to recreate driver after crash: {exc2}"
+                            html = None
+                            break
+                    else:
+                        failures[profile_url] = f"Failed to fetch page HTML after retries: {exc}"
+                        break
+
+            if not html:
+                # skip processing this username
+                continue
 
             cookies = {cookie['name']: cookie['value'] for cookie in driver.get_cookies()}
             if "msToken" not in cookies:
@@ -703,7 +745,9 @@ async def tiktok_profiles_batch(
                 return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
 
             saw_item_list_request = False
+           
             for request_data in driver.requests:
+                
                 url = getattr(request_data, "url", "") or ""
                 if "www.tiktok.com/api/post/item_list" not in url:
                     continue
@@ -711,37 +755,19 @@ async def tiktok_profiles_batch(
                     continue
                 saw_item_list_request = True
 
-                # Sync any Set-Cookie headers from this response into our cookie jar
-                resp_headers = getattr(request_data.response, "headers", {}) or {}
-                set_cookie_header = resp_headers.get("Set-Cookie") or resp_headers.get("set-cookie")
-                if set_cookie_header:
-                    cookie_parser = SimpleCookie()
-                    try:
-                        cookie_parser.load(set_cookie_header)
-                    except Exception:
-                        cookie_parser = None
-                    if cookie_parser:
-                        for key, morsel in cookie_parser.items():
-                            cookies[key] = morsel.value
-                # only reuse the captured browser response; skip replay to avoid signature mismatches
-                body = getattr(request_data.response, "body", b"")
-                if not body:
-                    continue
-                try:
-                    text = body.decode("utf-8")
-                except Exception:
-                    text = body.decode("utf-8", errors="ignore")
-                try:
-                    api_payload = json.loads(text)
-                    break
-                except Exception as exc:
-                    logger.warning(
-                        "Failed to decode captured TikTok item_list response for %s. First bytes: %r. Error: %s",
-                        username,
-                        body[:400],
-                        exc,
-                    )
-                    continue
+                return request_data.url
+                
+                # try:
+                resp = requests.get(request_data.url)
+                resp.raise_for_status()
+                api_payload = resp.json()
+                # except Exception as exc:
+                #     logger.warning("Failed to fetch/parse TikTok item_list API for %s: %s", username, exc)
+                #     continue
+
+                
+                
+                
 
             if not saw_item_list_request:
                 logger.warning(
@@ -754,7 +780,7 @@ async def tiktok_profiles_batch(
                     "TikTok item_list request captured but no JSON decoded for %s",
                     username,
                 )
-
+      
             soup = BeautifulSoup(html, "html.parser")
             logger.info("Profile %s page length %d chars", username, len(html))
             avatar_el = soup.select_one("[data-e2e='user-avatar'] img")

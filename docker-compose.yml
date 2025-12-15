@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  app:
+    build: .
+    ports:
+      - "8008:8008"
+    environment:
+      - DATABASE_URL=${DATABASE_URL}
+    volumes:
+      - chrome-profile:/data/chrome-profile
+      - html-dumps:/data/html-dumps
+      - ./app:/app/app
+    restart: unless-stopped
+
+volumes:
+  chrome-profile:
+  html-dumps:
