@@ -315,7 +315,7 @@ async def get_search_api_data(
 async def search_creator_snippets(
     keyword: str = Query(..., description="Keyword to search on TikTok, e.g. 'ไก่'")
 ):
-    """Return up to 50 unique creators (name, uniqueId, url) from TikTok search, paginating if needed."""
+    """Return up to 200 unique creators (name, uniqueId, url) from TikTok search, paginating if needed."""
     from seleniumwire import webdriver
     from selenium.webdriver.chrome.options import Options
     from selenium.webdriver.chrome.service import Service
@@ -385,13 +385,13 @@ async def search_creator_snippets(
             if payload:
                 payload_queue.append(payload)
 
-        # paginate until 50 creators gathered or no further data
-        while len(creators) < 50 and payload_queue:
+        # paginate until 200 creators gathered or no further data
+        while len(creators) < 200 and payload_queue:
             payload = payload_queue.pop(0)
             last_url = payload.get('__source_url__')
             data_blocks = payload.get("data") or []
             for block in data_blocks:
-                if len(creators) >= 50:
+                if len(creators) >= 200:
                     break
                 if not isinstance(block, dict):
                     continue
@@ -408,7 +408,7 @@ async def search_creator_snippets(
             has_more = payload.get("has_more")
             cursor = payload.get("cursor")
             if (
-                has_more and has_more != 0 and cursor is not None and len(creators) < 50 and last_url
+                has_more and has_more != 0 and cursor is not None and len(creators) < 200 and last_url
             ):
                 parsed = urlparse(last_url)
                 query = parse_qs(parsed.query)
@@ -430,7 +430,7 @@ async def search_creator_snippets(
 
     return {
         "keyword": keyword,
-        "creators": list(creators.values())[:50]
+        "creators": list(creators.values())[:200]
     }
 
 
@@ -470,16 +470,6 @@ async def search_top_creators(
         driver.get(search_url)
         time.sleep(5)
 
-        scroll_pause = 1.5
-        last_height = driver.execute_script("return document.body.scrollHeight")
-        for _ in range(6):
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(scroll_pause)
-            new_height = driver.execute_script("return document.body.scrollHeight")
-            if new_height == last_height:
-                break
-            last_height = new_height
-
         cookies_template = {cookie['name']: cookie['value'] for cookie in driver.get_cookies()}
         headers_template = None
         payload_queue = []
@@ -500,66 +490,149 @@ async def search_top_creators(
                 print(f"Error fetching TikTok general search API: {err}")
             return None
 
-        for request_data in driver.requests:
-            url = getattr(request_data, "url", "")
-            if not url or not request_data.response:
-                continue
-            if "www.tiktok.com/api/search/general/full" not in url:
-                continue
-            if url in seen_urls:
-                continue
-            seen_urls.add(url)
-            headers_template = dict(getattr(request_data, "headers", {}) or {})
-            payload = fetch_payload(url)
-            if payload:
-                payload_queue.append(payload)
-
-        while len(creators) < limit and payload_queue:
-            payload = payload_queue.pop(0)
-            source_url = payload.get("__source_url__")
-            data_blocks = payload.get("data") or []
-            for block in data_blocks:
-                if len(creators) >= limit:
-                    break
-                if not isinstance(block, dict):
+        def harvest_requests() -> int:
+            nonlocal headers_template
+            added = 0
+            for request_data in driver.requests:
+                url = getattr(request_data, "url", "")
+                if not url or not request_data.response:
                     continue
-                item = block.get("item") or {}
-                author = item.get("author") or {}
-                unique_id = author.get("uniqueId") or author.get("secUid")
-                nickname = author.get("nickname") or author.get("authorName")
-                if not unique_id and not nickname:
+                if "www.tiktok.com/api/search/general/full" not in url:
                     continue
-                profile_url = f"https://www.tiktok.com/@{unique_id}" if unique_id else (f"https://www.tiktok.com/@{nickname}" if nickname else "")
-                key = unique_id or nickname
-                if key and key not in creators:
-                    creators[key] = profile_url
-
-            cursor = payload.get("cursor")
-            has_more = payload.get("has_more")
-            data_section = payload.get("data") if isinstance(payload.get("data"), dict) else None
-            if data_section:
-                cursor = data_section.get("cursor") or cursor
-                has_more = data_section.get("has_more", has_more)
-
-            if (
-                has_more and has_more != 0 and cursor is not None and source_url and len(creators) < limit
-            ):
-                cursor_key = str(cursor)
-                if cursor_key in seen_cursors:
+                if url in seen_urls:
                     continue
-                seen_cursors.add(cursor_key)
-                parsed = urlparse(source_url)
-                query = parse_qs(parsed.query)
-                query['cursor'] = [cursor_key]
-                if 'offset' in query:
-                    query['offset'] = [cursor_key]
-                next_query = urlencode({k: v[0] if isinstance(v, list) else v for k, v in query.items()})
-                next_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, next_query, parsed.fragment))
-                if next_url not in seen_urls:
-                    next_payload = fetch_payload(next_url)
-                    if next_payload:
-                        seen_urls.add(next_url)
-                        payload_queue.append(next_payload)
+                seen_urls.add(url)
+                headers_template = dict(getattr(request_data, "headers", {}) or {})
+                payload = fetch_payload(url)
+                if payload:
+                    payload_queue.append(payload)
+                    added += 1
+            return added
+
+        def fetch_payload_via_browser(url: str):
+            script = """
+const targetUrl = arguments[0];
+const callback = arguments[arguments.length - 1];
+(async () => {
+    try {
+        let signedUrl = targetUrl;
+        if (window.byted_acrawler && typeof window.byted_acrawler.sign === "function") {
+            try {
+                const sig = window.byted_acrawler.sign({url: targetUrl});
+                if (sig) {
+                    if (typeof sig === "string") {
+                        const u = new URL(targetUrl);
+                        u.searchParams.set("_signature", sig);
+                        signedUrl = u.toString();
+                    } else if (typeof sig === "object") {
+                        if (sig.signature) {
+                            const u = new URL(targetUrl);
+                            u.searchParams.set("_signature", sig.signature);
+                            signedUrl = u.toString();
+                        } else if (sig.url) {
+                            signedUrl = sig.url;
+                        }
+                    }
+                }
+            } catch (signErr) {
+                // noop, fall back to unsigned URL
+            }
+        }
+        const resp = await fetch(signedUrl, {credentials: "include"});
+        const data = await resp.json();
+        callback({status: resp.status, data});
+    } catch (err) {
+        callback({error: err ? err.toString() : "unknown error"});
+    }
+})();
+"""
+            try:
+                result = driver.execute_async_script(script, url)
+            except Exception as js_err:
+                print(f"Browser fetch failed for {url}: {js_err}")
+                return None
+            if not isinstance(result, dict) or result.get("status") != 200:
+                return None
+            payload = result.get("data")
+            if isinstance(payload, dict):
+                payload["__source_url__"] = url
+            return payload
+
+        harvest_requests()
+        scroll_pause = 1.5
+        last_height = driver.execute_script("return document.body.scrollHeight")
+        idle_scrolls = 0
+        max_idle_scrolls = 5
+        start_time = time.time()
+
+        while len(creators) < limit:
+            while payload_queue and len(creators) < limit:
+                payload = payload_queue.pop(0)
+                data_blocks = payload.get("data") or []
+                for block in data_blocks:
+                    if len(creators) >= limit:
+                        break
+                    if not isinstance(block, dict):
+                        continue
+                    item = block.get("item") or {}
+                    author = item.get("author") or {}
+                    unique_id = author.get("uniqueId") or author.get("secUid")
+                    nickname = author.get("nickname") or author.get("authorName")
+                    if not unique_id and not nickname:
+                        continue
+                    profile_url = f"https://www.tiktok.com/@{unique_id}" if unique_id else (f"https://www.tiktok.com/@{nickname}" if nickname else "")
+                    key = unique_id or nickname
+                    if key and key not in creators:
+                        creators[key] = profile_url
+
+                cursor = payload.get("cursor")
+                has_more = payload.get("has_more")
+                data_section = payload.get("data") if isinstance(payload.get("data"), dict) else None
+                if data_section:
+                    cursor = data_section.get("cursor") or cursor
+                    has_more = data_section.get("has_more", has_more)
+
+                if (
+                    has_more and has_more != 0 and cursor is not None and len(creators) < limit
+                ):
+                    cursor_key = str(cursor)
+                    if cursor_key in seen_cursors:
+                        continue
+                    seen_cursors.add(cursor_key)
+                    source_url = payload.get("__source_url__") or ""
+                    parsed = urlparse(source_url)
+                    if not parsed.scheme:
+                        continue
+                    query = parse_qs(parsed.query)
+                    query["cursor"] = [cursor_key]
+                    if "offset" in query:
+                        query["offset"] = [cursor_key]
+                    next_query = urlencode({k: v[0] if isinstance(v, list) else v for k, v in query.items()})
+                    next_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, next_query, parsed.fragment))
+                    if next_url not in seen_urls:
+                        browser_payload = fetch_payload_via_browser(next_url)
+                        if browser_payload:
+                            seen_urls.add(next_url)
+                            payload_queue.append(browser_payload)
+
+            if len(creators) >= limit or time.time() - start_time > 60:
+                break
+
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(scroll_pause)
+            new_height = driver.execute_script("return document.body.scrollHeight")
+            if new_height == last_height:
+                idle_scrolls += 1
+            else:
+                idle_scrolls = 0
+                last_height = new_height
+
+            time.sleep(0.75)
+            new_payloads = harvest_requests()
+            if new_payloads > 0:
+                idle_scrolls = 0
+            elif idle_scrolls >= max_idle_scrolls:
+                break
     finally:
         driver.quit()
 
@@ -1123,7 +1196,3 @@ async def fetch_video_comments(
         post_full_url=video_url,
         list=rows
     )
-
-
-
-
